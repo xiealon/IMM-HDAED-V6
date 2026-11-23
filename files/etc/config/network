@@ -19,7 +19,6 @@ config interface 'lan'
 
 # 【主路由】WAN：接光猫 LAN 口走 DHCP；若是 PPPoE 拨号，把 proto 改成 pppoe 并填 username/password
 config interface 'wan'
-	option device 'eth1'
 	option proto 'dhcp'
 
 # 【主路由】WAN6：向运营商/上游要地址与前缀（PD），LAN 的 /64 从中分配
