@@ -280,7 +280,47 @@ log() { printf '[APP] %s\n' "$*"; }
 
 # 24.10 线才需要 _PA_CACHE（opkg list-installed 是全表扫描，缓存后只跑一次）；
 # 25.12 的 apk info -e 直接问包数据库，不需要缓存，本文件不保留这个变量。
+# 【2026-11-24 移植自 V4】已装名单/出厂名单各建一份快照，批量比对；装完必须作废，否则重判读到的是旧名单。
+_pa_snap_inst="/tmp/.pa-installed"
+_pa_snap_fact="/tmp/.pa-factory"
+
+# 已装包名快照：apk list --installed 优先，其次 apk info；行形如 busybox-1.36.1-r2
+_pa_snap_inst_build() {
+    [ -s "$_pa_snap_inst" ] && return 0
+    # 【2026-11-23】apk info 直接给纯包名，不需要再剥版本。
+    # 旧写法用 apk list --installed 再剥 -rN，遇到 luci-base-26.298.29275~c84adb9
+    # 这种 ~hash 版本剥不掉，导致 97 个包被误判缺失（真机实测）。
+    apk info 2>/dev/null | grep -E '^[A-Za-z0-9]' | sort -u > "$_pa_snap_inst"
+    # 自检：busybox / apk 必然在，认不出就是格式变了，整份作废
+    if grep -qxE 'busybox|apk' "$_pa_snap_inst"; then
+        return 0
+    fi
+    rm -f "$_pa_snap_inst"
+    return 1
+}
+
+# 出厂已装库快照（/rom 侧 P: 行），与 _pa_should 同源
+_pa_snap_fact_build() {
+    [ -s "$_pa_snap_fact" ] && return 0
+    sed -n 's/^P://p' "$ROMDIR/lib/apk/db/installed" 2>/dev/null | sort -u > "$_pa_snap_fact"
+    [ -s "$_pa_snap_fact" ]
+}
+
+# 【2026-11-24】装完包必须作废快照，否则后面再判「还缺谁」读的是装之前的旧名单。
+# 实测（V4 #8 开机）：12 个包包回后仍报 rc=1，因为 /tmp/.pa-installed 停在 01:04
+# 修复前；手动 rm 掉再 --check 立刻 rc=0。凡装过包就调一次，宁可多花一次 apk info。
+_pa_snap_reset() {
+    rm -f "$_pa_snap_inst" "$_pa_snap_fact" 2>/dev/null
+    return 0
+}
+
 _pa_installed() {
+    # ip 由 ip-full 提供（与 _pa_should 的别名表一致）
+    [ "$1" = "ip" ] && { _pa_installed ip-full; return; }
+    if _pa_snap_inst_build; then
+        grep -qxF "$1" "$_pa_snap_inst"
+        return
+    fi
     apk info -e "$1" >/dev/null 2>&1
 }
 
@@ -314,6 +354,25 @@ _pa_add_local() {
         apk add --no-network --allow-untrusted --force-overwrite "$1" >"$_pal_log" 2>&1
     fi
     _pal_rc=$?
+    # 【2026-11-24 移植自 V4】索引里的 filename 与实际文件名不一致时（如
+    # kmod-ppdev-6.12.103-r1.3af3e693.apk），按名字装会报
+    # package mentioned in index not found；这里按文件路径再装一次，
+    # 并且同样只认本地库，避免断网时去等在线源连接超时。
+    if [ "$_pal_rc" != 0 ]; then
+        for _pf in /rom/root/apk-cache/"$1"-[0-9]*.apk; do
+            [ -e "$_pf" ] || continue
+            if [ -s /rom/root/apk-cache/repositories ]; then
+                apk add --allow-untrusted --force-overwrite \
+                    --repositories-file /rom/root/apk-cache/repositories "$_pf" >>"$_pal_log" 2>&1
+            else
+                apk add --no-network --allow-untrusted --force-overwrite "$_pf" >>"$_pal_log" 2>&1
+            fi
+            if [ "$?" = 0 ]; then
+                _pal_rc=0
+                break
+            fi
+        done
+    fi
     rm -f "$_pal_log"
     return "$_pal_rc"
 }
@@ -407,6 +466,31 @@ _pa_oc_files_repair() {
     return 0
 }
 
+_pa_missing_all() {
+    _pa_snap_fact_build || return 0
+    _pa_snap_inst_build || return 0
+    _pa_a_exp=/tmp/.pa-all-exp.$$
+    _pa_a_have=/tmp/.pa-all-have.$$
+    _pa_a_cache=/tmp/.pa-all-cache.$$
+    _pa_a_ok=/tmp/.pa-all-ok.$$
+    grep -E '^[A-Za-z0-9]' "$_pa_snap_fact" | sort -u > "$_pa_a_exp"
+    # 同上：库内包名取索引真名（adbdump），失败才退回文件名正则
+    if ! apk adbdump /rom/root/apk-cache/packages.adb 2>/dev/null | sed -n 's/^ *- name: *//p' \
+            | grep -E '^[A-Za-z]' | sort -u > "$_pa_a_cache" || [ ! -s "$_pa_a_cache" ]; then
+        ls /rom/root/apk-cache 2>/dev/null | sed -n 's/\.apk$//p' \
+            | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+.*$//; s/-[0-9]{8,}.*$//; s/-r[0-9]+$//' \
+            | grep -E '^[A-Za-z]' | sort -u > "$_pa_a_cache"
+    fi
+    if [ -s "$_pa_a_cache" ]; then
+        grep -x -F -f "$_pa_a_cache" "$_pa_a_exp" > "$_pa_a_ok" 2>/dev/null
+    else
+        cp "$_pa_a_exp" "$_pa_a_ok"
+    fi
+    grep -E '^[A-Za-z0-9]' "$_pa_snap_inst" | sort -u > "$_pa_a_have"
+    grep -x -v -F -f "$_pa_a_have" "$_pa_a_ok" 2>/dev/null
+    rm -f "$_pa_a_exp" "$_pa_a_have" "$_pa_a_cache" "$_pa_a_ok"
+}
+
 _pa_missing() {
     _pa_m=""
     for _pa_p in $_PA_LIST; do
@@ -418,14 +502,22 @@ _pa_missing() {
 }
 
 _pa_check() {
+    # 【2026-11-24】先把快照作废再判：check 的结论必须是「此刻」的现场。
+    # 否则刚跑完 repair 的进程留下旧快照，下一次 check 会把已装回的包又报成缺失。
+    _pa_snap_reset
     _pa_cm=$(_pa_missing)
     [ -n "$_pa_cm" ] && printf '%s\n' "$_pa_cm"
+    # 全量兜底：固件装过、但现在缺了的（含库与 kmod）
+    _pa_ca=$(_pa_missing_all)
+    [ -n "$_pa_ca" ] && printf '%s\n' "$_pa_ca"
     _pa_oc_bad=0
     if ! _pa_oc_files_ok; then
         printf 'openclash-core(文件缺失)\n'
         _pa_oc_bad=1
     fi
-    [ -z "$_pa_cm" ] && [ "$_pa_oc_bad" = 0 ]
+    # 【2026-11-24】原来只看 _pa_cm 与 openclash 文件，全量那一列（_pa_ca）漏了：
+    # 只有全量项缺失时 check 仍返回 0，rc.local 就会判「齐全，跳过装回」。
+    [ -z "$_pa_cm" ] && [ -z "$_pa_ca" ] && [ "$_pa_oc_bad" = 0 ]
 }
 
 _pa_list() {
@@ -448,6 +540,9 @@ _pa_list() {
 }
 
 _pa_repair() {
+    # 【2026-11-24 移植自 V4】开跑先作废快照：判据必须是当下现场；
+    # 每装完一批再作废一次，下一批才不会拿装之前的旧名单去判「谁还缺」。
+    _pa_snap_reset
     # 【2026-11-19】依赖组先补。应用还在册、只有依赖被删时，apk add <应用> 是 no-op，
     # 不会把依赖拉回来，所以必须点名装库/kmod 本身。
     _pa_dm=$(_pa_missing_deps)
@@ -462,6 +557,7 @@ _pa_repair() {
         done
     fi
     # 开机补充组（21 个 luci-app）：同样点名装，装完不清缓存会看不到新菜单
+    _pa_snap_reset
     _pa_bm=$(_pa_missing_boot)
     if [ -n "$_pa_bm" ]; then
         for _pa_p in $_pa_bm; do
@@ -486,6 +582,7 @@ _pa_repair() {
     if ! _pa_oc_files_ok; then
         _pa_oc_files_repair
     fi
+    _pa_snap_reset
     _pa_n=0
     for _pa_p in $(_pa_missing); do
         _pa_n=$((_pa_n + 1))
@@ -520,9 +617,29 @@ _pa_repair() {
 		rm -rf /tmp/luci-modulecache/* 2>/dev/null
 		[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload >/dev/null 2>&1
 	fi
-    [ "$_pa_n" -gt 0 ] || log "无需装回（没有「该有却缺失」的应用）"
-    # 装完必须重判。apk 没有缓存，直接重算即可。
+    # 【2026-11-23 / 2026-11-24 移植自 V4】全量兜底：固件装过的一切（应用/库/kmod），
+    # 缺了就按本地库装回。名单外的包（依赖库、没进白名单的 kmod）以前查不出来。
+    _pa_snap_reset
+    _pa_an=0
+    for _pa_p in $(_pa_missing_all); do
+        _pa_an=$((_pa_an + 1))
+        log "装回 $_pa_p（全量保护）"
+        if _pa_installed "$_pa_p"; then
+            "$_RESTORE" --force "$_pa_p" >/dev/null 2>&1 \
+                && log "装回完成 $_pa_p（强制重装）" \
+                || log "装回失败 $_pa_p（强制重装没成功）"
+        elif _pa_add_local "$_pa_p"; then
+            log "装回完成 $_pa_p（全量保护）"
+        else
+            log "装回失败 $_pa_p（本地包库没有它）"
+        fi
+    done
+    [ "$((_pa_n + _pa_an))" -gt 0 ] || log "无需装回（没有「该有却缺失」的包）"
+    # 装完必须重判。apk 本身没有缓存，但快照有 —— 先作废再算，
+    # 否则读到装之前的旧名单，包明明装回来了也返回 1（V4 #8 开机实测）。
+    _pa_snap_reset
     [ -z "$(_pa_missing)" ] || return 1
+    [ -z "$(_pa_missing_all)" ] || return 1
     [ -z "$(_pa_missing_deps)" ] || return 1
     [ -z "$(_pa_missing_boot)" ] || return 1
     if ! _pa_oc_files_ok; then
