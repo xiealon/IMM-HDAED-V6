@@ -138,31 +138,33 @@ _lan_conf_valid() {
 # 物理网口列表：排除 lo/虚拟/桥接。前缀集合 = 有线（eth*/en*/lan*）+ USB 网卡（usb*）
 # + 移动模块数据口（wwan*）；wlan* 不在内——无线走 AP 模式，不是桥的物理口。
 # 用于 WAN-input 放行定责：单网口才需放行，多网口必有一个在 LAN，无需放行
-_phys_ports() {
+_phys_all() {
     # 这里 ls 是有意的：/sys/class/net 下的名字都是内核起的（eth0/br-lan/…）
     # shellcheck disable=SC2010
-    _pp_all=$(ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|en|lan|usb|wwan)' | grep -v -E '(lo|docker|veth|br-|tun|tap)' | sort || true)
-    # 【2026-11-23 主路由补丁】标记文件在时，WAN 口不能进 br-lan —— 否则桥把 WAN 吞掉，
-    # 拨号/取地址全废。单网口旁路由形态不受影响（标记不存在）。
-    if _is_main_router; then
-        for _wv in $(_wan_ports); do
-            _pp_all=$(printf '%s\n' "$_pp_all" | grep -v -x "$_wv" || true)
-        done
-    fi
-    [ -n "$_pp_all" ] && printf '%s\n' "$_pp_all"
-    return 0
+    ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|en|lan|usb|wwan)' | grep -v -E '(lo|docker|veth|br-|tun|tap)' | sort || true
 }
 
-# 【2026-11-23 主路由补丁】模式标记 + WAN 设备枚举
+# 【2026-11-23 主路由补丁】模式标记
 _is_main_router() { [ -e /etc/config/honk_main_router ]; }
 
-_wan_ports() {
-    for _wn in wan wan6; do
-        _wd=$(run uci -q get "network.$_wn.device" 2>/dev/null)
-        [ -n "$_wd" ] || continue
-        case "$_wd" in @*) continue ;; esac
-        printf '%s\n' "$_wd"
-    done
+# 主路由的 WAN 口：不锁死。uci 里写了非 @xxx 的 device 就用它，
+# 否则取物理口列表里的第一个（脚本枚举，谁先谁做 WAN）。
+_wan_dev() {
+    _wd=$(run uci -q get network.wan.device 2>/dev/null)
+    case "$_wd" in
+        ''|@*) _wd=$(_phys_all | sed -n '1p') ;;
+    esac
+    printf '%s\n' "$_wd"
+}
+
+# br-lan 收的物理口：主路由模式下排除 WAN 口
+_phys_ports() {
+    _pp_all=$(_phys_all)
+    if _is_main_router; then
+        _wp=$(_wan_dev)
+        [ -n "$_wp" ] && _pp_all=$(printf '%s\n' "$_pp_all" | grep -v -x "$_wp" || true)
+    fi
+    [ -n "$_pp_all" ] && printf '%s\n' "$_pp_all"
     return 0
 }
 
@@ -694,7 +696,27 @@ _net_write_guard() {
 # ---- 旁路由网络基线 builder（v.78-bp 同源；v.95 起真实写入）----
 
 # 桥接口 builder：br-lan 桥设备 + lan 指向它 + ports = 当前枚举物理口；清掉残留 cfg030f15
+# 【2026-11-23 主路由补丁】主路由：按枚举结果建 wan(dhcp) 与 wan6(dhcpv6, PD)
+build_wan_iface() {
+    _is_main_router || return 0
+    _wdev=$(_wan_dev)
+    [ -n "$_wdev" ] || { log "[WAN] 没枚举到物理网口，暂不建 WAN"; return 1; }
+    run uci -q set network.wan=interface
+    run uci -q set network.wan.proto='dhcp'
+    run uci -q set network.wan.device="$_wdev"
+    run uci -q set network.wan6=interface
+    run uci -q set network.wan6.proto='dhcpv6'
+    run uci -q set network.wan6.device='@wan'
+    run uci -q set network.wan6.reqaddress='try'
+    run uci -q set network.wan6.reqprefix='auto'
+    run uci -q set network.wan6.norelease='1'
+    run uci -q set network.wan6.peerdns='0'
+    log "[WAN] 主路由：WAN=$_wdev (dhcp)，其余物理口归 br-lan"
+    return 0
+}
+
 build_br_lan_ports() {
+    build_wan_iface || true
     _vp=$(_phys_ports)
     [ -n "$_vp" ] || { log "[BR_LAN] 未枚举到物理网口（驱动未就绪？），不敢建空桥，放弃写入"; return 1; }
     _net_write_guard "br-lan 桥与端口"
