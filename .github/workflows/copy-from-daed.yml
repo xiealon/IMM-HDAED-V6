@@ -25,7 +25,8 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git status --short | head -20
+          git status --short > /tmp/st.txt || true
+          head -20 /tmp/st.txt || true
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           git commit -m "chore: 从 ImmortalWrt-ImageBuilder-25.12-daed 整体拷贝（v6 仓基线）"
           git push origin HEAD
