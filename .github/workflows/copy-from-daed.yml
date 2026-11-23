@@ -14,6 +14,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Clone source and copy everything
         run: |
@@ -29,4 +30,5 @@ jobs:
           head -20 /tmp/st.txt || true
           if git diff --cached --quiet; then echo "无变化"; exit 0; fi
           git commit -m "chore: 从 ImmortalWrt-ImageBuilder-25.12-daed 整体拷贝（v6 仓基线）"
-          git push origin HEAD
+          git remote set-url origin "https://x-access-token:${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -u origin HEAD:main
