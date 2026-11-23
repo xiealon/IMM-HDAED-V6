@@ -139,10 +139,31 @@ _lan_conf_valid() {
 # + 移动模块数据口（wwan*）；wlan* 不在内——无线走 AP 模式，不是桥的物理口。
 # 用于 WAN-input 放行定责：单网口才需放行，多网口必有一个在 LAN，无需放行
 _phys_ports() {
-    # 这里 ls 是有意的：/sys/class/net 下的名字都是内核起的（eth0/br-lan/…），
-    # 不存在空格、换行这类会把 glob 撑坏的情况；换成 glob 反而要处理通配符空匹配。
+    # 这里 ls 是有意的：/sys/class/net 下的名字都是内核起的（eth0/br-lan/…）
     # shellcheck disable=SC2010
-    ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|en|lan|usb|wwan)' | grep -v -E '(lo|docker|veth|br-|tun|tap)' | sort
+    _pp_all=$(ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|en|lan|usb|wwan)' | grep -v -E '(lo|docker|veth|br-|tun|tap)' | sort || true)
+    # 【2026-11-23 主路由补丁】标记文件在时，WAN 口不能进 br-lan —— 否则桥把 WAN 吞掉，
+    # 拨号/取地址全废。单网口旁路由形态不受影响（标记不存在）。
+    if _is_main_router; then
+        for _wv in $(_wan_ports); do
+            _pp_all=$(printf '%s\n' "$_pp_all" | grep -v -x "$_wv" || true)
+        done
+    fi
+    [ -n "$_pp_all" ] && printf '%s\n' "$_pp_all"
+    return 0
+}
+
+# 【2026-11-23 主路由补丁】模式标记 + WAN 设备枚举
+_is_main_router() { [ -e /etc/config/honk_main_router ]; }
+
+_wan_ports() {
+    for _wn in wan wan6; do
+        _wd=$(run uci -q get "network.$_wn.device" 2>/dev/null)
+        [ -n "$_wd" ] || continue
+        case "$_wd" in @*) continue ;; esac
+        printf '%s\n' "$_wd"
+    done
+    return 0
 }
 
 # 列表归一化：把「多行」或「空格分隔」的列表统一成「排序后的单行」（v.99-bp.1）
