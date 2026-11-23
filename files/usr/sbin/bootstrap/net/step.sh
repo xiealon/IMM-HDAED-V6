@@ -301,7 +301,10 @@ verify_lan_input() {
     # 【2026-11-14 加】lan6 必须在 lan zone 的 network 列表里，否则 IPv6 被默认策略丢掉
     _vlz=$(_zone_sec lan) 2>/dev/null
     if [ -n "$_vlz" ]; then
-        run uci -q show "firewall.$_vlz" 2>/dev/null | grep -q "lan6" || return 1
+        # 【2026-11-23 主路由补丁】主路由不建 lan6（v6 由 wan6 提供 PD），不再要求它在 lan zone 里
+        if ! _is_main_router; then
+            run uci -q show "firewall.$_vlz" 2>/dev/null | grep -q "lan6" || return 1
+        fi
     fi
     _lz=$(_zone_sec lan) || { log "[FW] 未找到 lan zone，本轮不校验 input/forward"; return 0; }
     [ "$(run uci -q get firewall.$_lz.input 2>/dev/null)" = "ACCEPT" ] || return 1
@@ -370,6 +373,8 @@ verify_lan_static() {
         [ -z "$(run uci -q get network.lan.gateway 2>/dev/null)" ] || return 1
         [ -z "$(run uci -q get network.lan.dns 2>/dev/null)" ] || return 1
         [ "$(run uci -q get network.wan6.proto 2>/dev/null)" = "dhcpv6" ] || return 1
+        [ "$(run uci -q get network.wan.proto 2>/dev/null)" = "dhcp" ] || return 1
+        [ -n "$(run uci -q get network.wan.device 2>/dev/null)" ] || return 1
     else
         [ "$(run uci -q get network.lan.gateway 2>/dev/null)" = "$3" ] || return 1
         [ "$(run uci -q get network.lan.dns 2>/dev/null)" = "$4" ] || return 1
@@ -711,7 +716,10 @@ build_wan_iface() {
     run uci -q set network.wan6.reqprefix='auto'
     run uci -q set network.wan6.norelease='1'
     run uci -q set network.wan6.peerdns='0'
-    log "[WAN] 主路由：WAN=$_wdev (dhcp)，其余物理口归 br-lan"
+    # 【保护】必须自己 commit：verify_lan_static 在主路由下只查 wan6.proto，
+    # 一旦判为「已就绪」就不会跑 build_lan_static，wan 只留在 uci delta 里，重启即丢。
+    run uci -q commit network 2>/dev/null || { log "[WAN] commit network 失败（wan/wan6 未落盘）"; return 1; }
+    log "[WAN] 主路由：WAN=$_wdev (dhcp)，其余物理口归 br-lan，已 commit"
     return 0
 }
 
@@ -1050,9 +1058,14 @@ build_lan_input() {
     # 【2026-11-14 加】确保 lan6 在这个 zone 的 network 列表里。
     # lan6 是独立 UCI 接口（不是 lan 的别名），fw4 按接口名匹配 zone；
     # 不在列表里 → IPv6 包不属于任何 zone → 按默认策略 DROP。
-    if ! run uci -q show "firewall.$_lz" 2>/dev/null | grep -q "lan6"; then
-        run uci -q add_list "firewall.$_lz.network=lan6"
-        log "[FW] lan zone 已纳入 lan6"
+    if ! _is_main_router; then
+        if ! run uci -q show "firewall.$_lz" 2>/dev/null | grep -q "lan6"; then
+            run uci -q add_list "firewall.$_lz.network=lan6"
+            log "[FW] lan zone 已纳入 lan6"
+        fi
+    else
+        # 【2026-11-23 主路由补丁】清掉历史残留的 lan6 归属（接口已不存在，留着是悬空引用）
+        run uci -q del_list "firewall.$_lz.network=lan6" 2>/dev/null
     fi
     log "[FW] lan zone input/forward 已置 ACCEPT（含 lan6）"
     return 0
