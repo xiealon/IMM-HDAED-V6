@@ -1,4 +1,3 @@
-
 config interface 'loopback'
 	option device 'lo'
 	option proto 'static'
@@ -6,28 +5,30 @@ config interface 'loopback'
 	option netmask '255.0.0.0'
 
 config globals 'globals'
-	option ula_prefix 'fd80:e247:db6e::/48'
 	option packet_steering '1'
+	# 主路由：若上游下发 PD，LAN 会用 PD 前缀；这个 ULA 只是拿不到 PD 时的兜底
+	option ula_prefix 'fd80:e247:db6e::/48'
 
 config interface 'lan'
 	option device 'br-lan'
 	option proto 'static'
-	option ipaddr '10.0.0.201'
+	option ipaddr '192.168.1.1'
 	option netmask '255.255.255.0'
-	option gateway '10.0.0.10'
-	list dns '10.0.0.10'
-	option delegate '0'
 	option ip6assign '64'
-	option ip6ifaceid 'eui64'
+	option delegate '0'
 
-config interface 'lan6'
+# 【主路由】WAN：接光猫 LAN 口走 DHCP；若是 PPPoE 拨号，把 proto 改成 pppoe 并填 username/password
+config interface 'wan'
+	option device 'eth1'
+	option proto 'dhcp'
+
+# 【主路由】WAN6：向运营商/上游要地址与前缀（PD），LAN 的 /64 从中分配
+config interface 'wan6'
+	option device '@wan'
 	option proto 'dhcpv6'
-	option device '@lan'
 	option reqaddress 'try'
 	option reqprefix 'auto'
 	option norelease '1'
-	option sendclientid 'auto'
-	option peerdns '0'
 
 config interface 'vpn0'
 	option proto 'none'
