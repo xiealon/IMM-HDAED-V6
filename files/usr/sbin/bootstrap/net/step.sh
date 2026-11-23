@@ -117,6 +117,13 @@ _is_ipv4() {
 }
 _lan_conf_valid() {
     _lc_ip="$1"; _lc_nm="$2"; _lc_gw="$3"; _lc_dn="$4"
+    # 【2026-11-23 主路由补丁】主路由没有「上游网关」概念，只校验 IP 与掩码
+    if _is_main_router; then
+        _is_ipv4 "$_lc_ip" || return 1
+        _is_ipv4 "$_lc_nm" || return 1
+        case "$_lc_ip" in 0.*|255.255.255.255) return 1 ;; esac
+        return 0
+    fi
     for _lc_v in "$_lc_ip" "$_lc_nm" "$_lc_gw" "$_lc_dn"; do
         _is_ipv4 "$_lc_v" || return 1
     done
@@ -327,13 +334,23 @@ verify_lan_static() {
     #   · lan6 被禁 → 不发 RS、不拿 PD → 下游 8c01 段地址消失。
     # 代价是「禁用该接口」这个开关此后由脚本维护，手动关了 10~12 分钟内会被改回。
     [ "$(run uci -q get network.lan.disabled 2>/dev/null)" != "1" ] || return 1
-    [ "$(run uci -q get network.lan6.disabled 2>/dev/null)" != "1" ] || return 1
+    # 【2026-11-23 主路由补丁】主路由不建 lan6，整段 lan6 校验改为「不存在即通过」
+    if ! _is_main_router; then
+        [ "$(run uci -q get network.lan6.disabled 2>/dev/null)" != "1" ] || return 1
+    fi
     [ "$(run uci -q get network.lan.proto 2>/dev/null)" = "static" ] || return 1
     [ "$(run uci -q get network.lan.device 2>/dev/null)" = "br-lan" ] || return 1
     [ "$(run uci -q get network.lan.ipaddr 2>/dev/null)" = "$1" ] || return 1
     [ "$(run uci -q get network.lan.netmask 2>/dev/null)" = "$2" ] || return 1
-    [ "$(run uci -q get network.lan.gateway 2>/dev/null)" = "$3" ] || return 1
-    [ "$(run uci -q get network.lan.dns 2>/dev/null)" = "$4" ] || return 1
+    # 【2026-11-23 主路由补丁】主路由没有 LAN gateway/dns，改为校验 wan/wan6 就绪
+    if _is_main_router; then
+        [ -z "$(run uci -q get network.lan.gateway 2>/dev/null)" ] || return 1
+        [ -z "$(run uci -q get network.lan.dns 2>/dev/null)" ] || return 1
+        [ "$(run uci -q get network.wan6.proto 2>/dev/null)" = "dhcpv6" ] || return 1
+    else
+        [ "$(run uci -q get network.lan.gateway 2>/dev/null)" = "$3" ] || return 1
+        [ "$(run uci -q get network.lan.dns 2>/dev/null)" = "$4" ] || return 1
+    fi
     # 【2026-11-10.0355】配置对 ≠ 地址在。
     # 上面六条全是 uci get —— 读的是 /etc/config/network，不是网卡。
     # 真机现场（192.168.1.201，2026-11-10 03:50 重启）：配置文件里 201 一直在，
@@ -350,12 +367,15 @@ verify_lan_static() {
     # 表现为 --fix 跑完 lan6 还是没有（2026-11-14 在 192.168.1.201 实测踩到）。
     # 没有 lan6 的后果：br-lan 拿不到 DHCPv6 地址（如果上游只发 DHCPv6），
     # 且防火墙 lan zone 里那条 lan6 成了悬空项。
-    run uci -q show network 2>/dev/null | grep -q '^network\.lan6=interface$' || return 1
+    if ! _is_main_router; then
+        run uci -q show network 2>/dev/null | grep -q '^network\.lan6=interface$' || return 1
+    fi
     # 【2026-11-15 用户定】lan6 的七个 option 也锁死。
     # 原来只判「段存在」：段在、但 proto 被改成 static 或 peerdns 被改成 1 时，
     # verify 照样判通过 → build 不跑 → 配置一直是坏的却没人发现。
     # 改错的后果：proto 不对则 br-lan 拿不到 DHCPv6 地址；peerdns=1 则上游 DNS
     # 会写进 resolv.conf.auto，和本机 smartdns 抢解析。
+    if ! _is_main_router; then
     [ "$(run uci -q get network.lan6.proto 2>/dev/null)" = "dhcpv6" ] || return 1
     [ "$(run uci -q get network.lan6.device 2>/dev/null)" = "@lan" ] || return 1
     [ "$(run uci -q get network.lan6.reqaddress 2>/dev/null)" = "try" ] || return 1
@@ -363,6 +383,7 @@ verify_lan_static() {
     [ "$(run uci -q get network.lan6.norelease 2>/dev/null)" = "1" ] || return 1
     [ "$(run uci -q get network.lan6.sendclientid 2>/dev/null)" = "auto" ] || return 1
     [ "$(run uci -q get network.lan6.peerdns 2>/dev/null)" = "0" ] || return 1
+    fi
     # 【2026-11-14 加】IPv6 前缀分配（用户实测确认）。
     # 位置必须在 lan 上，不能放 lan6：lan6 是 PD 的提供方，给它设 ip6assign 等于
     # 从自己的池里再切一块给自己，netifd 会直接报
@@ -727,11 +748,23 @@ build_lan_static() {
     run uci -q set network.lan.device='br-lan'
     run uci -q set network.lan.ipaddr="$1"
     run uci -q set network.lan.netmask="$2"
-    run uci -q set network.lan.gateway="$3"
-    run uci -q delete network.lan.dns 2>/dev/null
-    run uci -q add_list network.lan.dns="$4"
+    # 【2026-11-23 主路由补丁】主路由的默认路由来自 wan，LAN 不能写 gateway/dns，
+    # 否则 netifd 会挂一条指向不存在网关的默认路由，把外网顶掉。
+    if _is_main_router; then
+        run uci -q delete network.lan.gateway 2>/dev/null
+        run uci -q delete network.lan.dns 2>/dev/null
+    else
+        run uci -q set network.lan.gateway="$3"
+        run uci -q delete network.lan.dns 2>/dev/null
+        run uci -q add_list network.lan.dns="$4"
+    fi
     # ---- lan6：IPv6 客户端（跟随 lan 的 device）----
     # 幂等：已存在就整段覆盖成目标值（不用 if 判断），配置漂移也能一次纠正。
+    # 【2026-11-23 主路由补丁】主路由没有 lan6：v6 由 wan6 向运营商要地址+PD，
+    # LAN 只做 PD 前缀分配（ip6assign），所以这里把历史上可能残留的 lan6 删掉。
+    if _is_main_router; then
+        run uci -q delete network.lan6 2>/dev/null
+    else
     run uci -q set network.lan6=interface
     run uci -q set network.lan6.proto='dhcpv6'
     run uci -q set network.lan6.device='@lan'
@@ -740,6 +773,7 @@ build_lan_static() {
     run uci -q set network.lan6.norelease='1'
     run uci -q set network.lan6.sendclientid='auto'
     run uci -q set network.lan6.peerdns='0'
+    fi
     # ---- lan：IPv6 前缀分配（用户 2026-11-14 定：长度 64）----
     # ip6assign='64'：从 lan6 向光猫要到的 PD 池里切一段 /64 给 lan
     # 【2026-11-14 用户定】不写 ip6hint：让 netifd 自己挑空位。
