@@ -1,0 +1,30 @@
+name: copy from daed repo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  copy:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Clone source and copy everything
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/xiealon/ImmortalWrt-ImageBuilder-25.12-daed.git /tmp/src
+          rm -rf /tmp/src/.git
+          # 保留本仓的 .github/workflows/copy-from-daed.yml 之外，其余全部覆盖
+          rsync -a --exclude '.git' /tmp/src/ ./
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short | head -20
+          if git diff --cached --quiet; then echo "无变化"; exit 0; fi
+          git commit -m "chore: 从 ImmortalWrt-ImageBuilder-25.12-daed 整体拷贝（v6 仓基线）"
+          git push origin HEAD
