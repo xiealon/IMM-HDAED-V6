@@ -1,5 +1,5 @@
 # IMM-HDAED-V6
-## 配置了V4与V6的主路由模式固件 ##
+配置了V4与V6的主路由模式固件
 
 # 特殊提示:
 若未在action的enroll处填入key
